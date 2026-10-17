@@ -33,6 +33,10 @@ CORE_DISTS = (
     "src/tools/dbimport/dbimport.conf.dist",
 )
 
+# A prefix change (e.g. AiPlayerbot.X -> Playerbots.X) counts as a rename only when it explains at
+# least this many keys, so a lone "Old.Enable" is never matched to an unrelated "New.Enable".
+MIN_PREFIX_RENAMES = 3
+
 EXTRA_HEADER = [
     "",
     "###################################################################################################",
@@ -218,6 +222,40 @@ class Conf:
             self.values[key] = value
             self.lines[key] = line
 
+    def rename(self, old, new):
+        self.values[new] = self.values.pop(old)
+        self.lines[new] = self.lines.pop(old).replace(old, new, 1)
+        self.order[self.order.index(old)] = new
+
+
+def find_renames(missing, extras):
+    """Map conf-only keys to new dist keys that differ only by a renamed first segment.
+
+    The same prefix change must explain at least MIN_PREFIX_RENAMES keys.
+    """
+    new_by_rest = {}
+    for key in missing:
+        head, _, rest = key.partition(".")
+        if rest:
+            new_by_rest.setdefault(rest, []).append(key)
+    candidates = {}
+    for key in extras:
+        head, _, rest = key.partition(".")
+        for new in new_by_rest.get(rest, []):
+            new_head = new.partition(".")[0]
+            if new_head != head:
+                candidates.setdefault((head, new_head), []).append((key, new))
+    renames = {}
+    taken = set()
+    for pairs in candidates.values():
+        if len(pairs) < MIN_PREFIX_RENAMES:
+            continue
+        for old, new in pairs:
+            if old not in renames and new not in taken:
+                renames[old] = new
+                taken.add(new)
+    return renames
+
 
 def dist_key_docs(dist_lines):
     """Map each dist key to the comment block right above it, for the review prompt."""
@@ -276,6 +314,12 @@ class Pair:
         self.conf_text, conf_lines = read_lines(self.conf_path)
         self.conf = Conf(conf_lines)
         dist = Conf(self.dist_lines)
+        missing = [k for k in dist.order if k not in self.conf.values]
+        extras = [k for k in self.conf.order if k not in dist.values]
+        # Carry values over to renamed keys, so they do not silently fall back to the dist defaults.
+        self.renames = find_renames(missing, extras)
+        for old, new in self.renames.items():
+            self.conf.rename(old, new)
         self.missing = [k for k in dist.order if k not in self.conf.values]
         self.extras = [k for k in self.conf.order if k not in dist.values]
         self.changed = rebuild(self.dist_lines, self.conf, set(self.missing)) != self.conf_text
@@ -284,6 +328,8 @@ class Pair:
         if not self.has_conf:
             return "no conf file (copy the dist to create it)"
         parts = []
+        if self.renames:
+            parts.append(f"{len(self.renames)} renamed")
         if self.missing:
             parts.append(f"{len(self.missing)} new")
         if self.extras:
@@ -369,6 +415,14 @@ def process(pair, args):
         return
     for key in pair.conf.duplicates:
         print(f"  Warning: {key} is set more than once; keeping the last value.")
+    if pair.renames:
+        print(f"  {len(pair.renames)} key(s) renamed in dist, your values are carried over:")
+        prefixes = {}
+        for old, new in pair.renames.items():
+            change = (old.partition(".")[0], new.partition(".")[0])
+            prefixes[change] = prefixes.get(change, 0) + 1
+        for (old_head, new_head), count in prefixes.items():
+            print(f"    {old_head}.* -> {new_head}.* ({count})")
     if pair.missing:
         print(f"  {len(pair.missing)} new key(s) in dist:")
         for key in pair.missing:

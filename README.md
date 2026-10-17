@@ -11,6 +11,9 @@ Each `X.conf` that sits next to a dist is **rebuilt on the dist template**:
 - Each key keeps the value from your conf, exactly as you wrote it.
 - Keys that are new in the dist are added at their default value. You can also review them one by one, or
   skip them; a skipped key is written commented out and offered again on the next run.
+- When a module renames the first part of its keys (for example `AiPlayerbot.MaxRandomBots` became
+  `Playerbots.MaxRandomBots`), your values are carried over to the new names. A prefix change counts as a
+  rename only when it covers at least 3 keys whose names are otherwise identical.
 - Keys that exist only in your conf (obsolete, renamed or custom) are kept in a
   `KEYS NOT IN DIST` block at the end of the file. When a conf-only key looks like one of the new keys,
   the summary prints a "renamed to …?" hint.
