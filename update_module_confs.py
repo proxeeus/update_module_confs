@@ -7,6 +7,8 @@ you decline them). Keys that only exist in your conf are kept in a block at the 
 After a run, `diff X.conf.dist X.conf` shows only your changed values and that block.
 
 Scanned files: <etc>/*.conf.dist (worldserver, authserver, dbimport) and <etc>/modules/*.conf.dist.
+Before that, the deployed dists are refreshed from your azerothcore-wotlk source folder (skip with
+--no-refresh).
 """
 import argparse
 import datetime
@@ -23,6 +25,13 @@ SETTINGS_PATH = os.path.join(SCRIPT_DIR, "settings.json")
 
 # An active "Key = value" line: not a comment, not a [section] header.
 KEY_LINE = re.compile(r"^(\s*)([^\s#=\[][^=]*?)(\s*=\s*)(.*)$")
+
+# Core dists in the azerothcore-wotlk source tree; they are deployed to <etc>/.
+CORE_DISTS = (
+    "src/server/apps/worldserver/worldserver.conf.dist",
+    "src/server/apps/authserver/authserver.conf.dist",
+    "src/tools/dbimport/dbimport.conf.dist",
+)
 
 EXTRA_HEADER = [
     "",
@@ -52,38 +61,128 @@ def save_settings(settings):
         f.write("\n")
 
 
+def ask_folder(label, current, is_valid, error):
+    while True:
+        prompt = f"{label} [{current}]: " if current else f"{label}: "
+        answer = input(prompt).strip() or (current or "")
+        path = os.path.abspath(os.path.expanduser(answer)) if answer else ""
+        if path and is_valid(path):
+            return path
+        print(f"  {error}, try again.")
+
+
 def ask_etc_dir(current=None):
     print("Enter the path to your config folder (the 'etc' folder holding worldserver.conf;")
     print("module confs are read from its 'modules' subfolder).")
-    while True:
-        prompt = f"Config folder [{current}]: " if current else "Config folder: "
-        answer = input(prompt).strip() or (current or "")
-        path = os.path.abspath(os.path.expanduser(answer)) if answer else ""
-        if path and os.path.isdir(path):
-            return path
-        print("  Not a valid directory, try again.")
+    return ask_folder("Config folder", current, os.path.isdir, "Not a valid directory")
 
 
-def resolve_etc_dir(args):
-    if args.etc_dir:
-        path = os.path.abspath(os.path.expanduser(args.etc_dir))
-        if not os.path.isdir(path):
-            sys.exit(f"{path} is not a directory.")
+def is_source_dir(path):
+    return os.path.isfile(os.path.join(path, CORE_DISTS[0]))
+
+
+def ask_source_dir(current=None):
+    print("Enter the path to your azerothcore-wotlk source folder (the one holding src/ and modules/);")
+    print("the .conf.dist files in the config folder are refreshed from it before each run.")
+    return ask_folder("Source folder", current, is_source_dir, f"No {CORE_DISTS[0]} there")
+
+
+def resolve_folder(override, key, label, is_valid, ask_fn, reconfigure):
+    """Folder from the command line, else from settings.json, else asked for and saved."""
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        if not is_valid(path):
+            sys.exit(f"{path} is not a valid {label.lower()}.")
         return path
 
     settings = load_settings()
-    saved = settings.get("etc_dir")
-    if saved and not os.path.isdir(saved):
-        print(f"Saved config folder {saved} no longer exists.")
+    saved = settings.get(key)
+    if saved and not is_valid(saved):
+        print(f"Saved {label.lower()} {saved} is no longer valid.")
         saved = None
-    if saved and not args.reconfigure:
+    if saved and not reconfigure:
         return saved
 
-    path = ask_etc_dir(saved)
-    settings["etc_dir"] = path
+    path = ask_fn(saved)
+    settings[key] = path
     save_settings(settings)
     print(f"Saved to {SETTINGS_PATH}\n")
     return path
+
+
+def resolve_etc_dir(args):
+    return resolve_folder(args.etc_dir, "etc_dir", "Config folder", os.path.isdir, ask_etc_dir,
+                          args.reconfigure)
+
+
+def resolve_source_dir(args):
+    return resolve_folder(args.source_dir, "source_dir", "Source folder", is_source_dir, ask_source_dir,
+                          args.reconfigure)
+
+
+# --- Refresh dists from source -------------------------------------------------------------------
+
+def source_dists(source_dir):
+    """(source path, deployed path relative to etc) for each dist in the source tree."""
+    result = [(os.path.join(source_dir, rel), os.path.basename(rel)) for rel in CORE_DISTS]
+    modules_dir = os.path.join(source_dir, "modules")
+    if os.path.isdir(modules_dir):
+        for module in sorted(os.listdir(modules_dir), key=str.lower):
+            conf_dir = os.path.join(modules_dir, module, "conf")
+            if not os.path.isdir(conf_dir):
+                continue
+            for fname in sorted(os.listdir(conf_dir), key=str.lower):
+                if fname.endswith(".conf.dist"):
+                    result.append((os.path.join(conf_dir, fname), os.path.join("modules", fname)))
+    return result
+
+
+def same_content(a, b):
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        return fa.read() == fb.read()
+
+
+def refresh_dists(etc_dir, source_dir, dry_run):
+    """Copy source dists that differ from the deployed ones into etc.
+
+    Returns {deployed path: source path} for the copies a dry run skipped, so the comparison
+    can still use the dists the real run would deploy.
+    """
+    print(f"\nRefreshing .conf.dist files from {source_dir}")
+    pending = {}
+    seen = {}
+    refreshed = 0
+    unconfigured = []
+    for src, rel in source_dists(source_dir):
+        if not os.path.isfile(src):
+            print(f"  Warning: {os.path.relpath(src, source_dir)} not found in the source folder.")
+            continue
+        if rel in seen:
+            print(f"  Warning: {os.path.relpath(src, source_dir)} has the same name as "
+                  f"{os.path.relpath(seen[rel], source_dir)}; skipping it.")
+            continue
+        seen[rel] = src
+        dest = os.path.join(etc_dir, rel)
+        if rel.startswith("modules" + os.sep) and not os.path.exists(dest[:-len(".dist")]):
+            unconfigured.append(rel[:-len(".dist")])
+        if os.path.isfile(dest) and same_content(src, dest):
+            continue
+        action = "new" if not os.path.exists(dest) else "updated"
+        refreshed += 1
+        if dry_run:
+            pending[dest] = src
+            print(f"  Would refresh {rel} ({action})")
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(src, dest)
+        print(f"  Refreshed {rel} ({action})")
+    if not refreshed:
+        print("  All deployed dists match the source.")
+    if unconfigured:
+        print("  Module dists with no deployed conf yet (copy the dist to create it):")
+        for name in unconfigured:
+            print(f"    - {name}")
+    return pending
 
 
 # --- Parsing -------------------------------------------------------------------------------------
@@ -166,14 +265,14 @@ def rebuild(dist_lines, conf, accepted_new):
 
 
 class Pair:
-    def __init__(self, etc_dir, dist_path):
+    def __init__(self, etc_dir, dist_path, read_from=None):
         self.dist_path = dist_path
         self.conf_path = dist_path[:-len(".dist")]
         self.name = os.path.relpath(self.conf_path, etc_dir)
         self.has_conf = os.path.exists(self.conf_path)
         if not self.has_conf:
             return
-        _, self.dist_lines = read_lines(dist_path)
+        _, self.dist_lines = read_lines(read_from or dist_path)
         self.conf_text, conf_lines = read_lines(self.conf_path)
         self.conf = Conf(conf_lines)
         dist = Conf(self.dist_lines)
@@ -196,14 +295,17 @@ class Pair:
         return ", ".join(parts)
 
 
-def find_pairs(etc_dir):
+def find_pairs(etc_dir, pending=None):
+    """Pairs for the deployed dists; `pending` maps dists a dry run did not copy to their source."""
+    pending = pending or {}
     pairs = []
     for folder in (etc_dir, os.path.join(etc_dir, "modules")):
-        if not os.path.isdir(folder):
-            continue
-        for fname in sorted(os.listdir(folder), key=str.lower):
+        names = set(os.listdir(folder)) if os.path.isdir(folder) else set()
+        names.update(os.path.basename(p) for p in pending if os.path.dirname(p) == folder)
+        for fname in sorted(names, key=str.lower):
             if fname.endswith(".conf.dist"):
-                pairs.append(Pair(etc_dir, os.path.join(folder, fname)))
+                dist_path = os.path.join(folder, fname)
+                pairs.append(Pair(etc_dir, dist_path, pending.get(dist_path)))
     return pairs
 
 
@@ -318,9 +420,9 @@ def needs_work(pairs):
     return [p for p in pairs if p.has_conf and p.changed]
 
 
-def menu_loop(etc_dir, args):
+def menu_loop(etc_dir, args, pending):
     while True:
-        pairs = find_pairs(etc_dir)
+        pairs = find_pairs(etc_dir, pending)
         if not pairs:
             print(f"No .conf.dist files found in {etc_dir} or its modules folder.")
             return
@@ -344,24 +446,32 @@ def menu_loop(etc_dir, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--etc-dir", help="config folder for this run only (does not change the saved one)")
-    parser.add_argument("--reconfigure", action="store_true", help="ask for the config folder again and save it")
+    parser.add_argument("--source-dir", help="azerothcore-wotlk source folder for this run only "
+                                             "(does not change the saved one)")
+    parser.add_argument("--reconfigure", action="store_true", help="ask for both folders again and save them")
+    parser.add_argument("--no-refresh", action="store_true",
+                        help="do not refresh the deployed .conf.dist files from the source folder")
     parser.add_argument("--all", action="store_true", help="process every file that needs it, without the menu")
     parser.add_argument("--yes", action="store_true", help="add all new keys and write without asking")
-    parser.add_argument("--dry-run", action="store_true", help="show summaries and diffs, write nothing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="show the dists that would be refreshed, summaries and diffs; write nothing")
     args = parser.parse_args()
 
     print("AzerothCore Config Updater")
     print("--------------------------")
     try:
         etc_dir = resolve_etc_dir(args)
+        pending = {}
+        if not args.no_refresh:
+            pending = refresh_dists(etc_dir, resolve_source_dir(args), args.dry_run)
         if args.all:
-            selected = needs_work(find_pairs(etc_dir))
+            selected = needs_work(find_pairs(etc_dir, pending))
             if not selected:
                 print("Everything is up to date.")
             for pair in selected:
                 process(pair, args)
         else:
-            menu_loop(etc_dir, args)
+            menu_loop(etc_dir, args, pending)
     except (EOFError, KeyboardInterrupt):
         print()
     print("Goodbye!")

@@ -24,14 +24,32 @@ are not touched.
 > The first run also replaces any comment lines in your confs that no longer match the dist, including notes
 > you wrote by hand. Use **D** (diff) before writing, or keep the backup.
 
+## Refreshing the dists
+
+Before comparing, the script copies the current `.conf.dist` files from your `azerothcore-wotlk` source folder
+into the `etc` folder, so the confs are compared with the dists of the code you build:
+
+| Source | Copied to |
+|---|---|
+| `src/server/apps/worldserver/worldserver.conf.dist` | `<etc>/` |
+| `src/server/apps/authserver/authserver.conf.dist` | `<etc>/` |
+| `src/tools/dbimport/dbimport.conf.dist` | `<etc>/` |
+| `modules/*/conf/*.conf.dist` | `<etc>/modules/` |
+
+A dist is copied only when its content differs from the deployed one, and each copied file is printed.
+Module dists that have no `.conf` in `<etc>/modules/` yet are listed, so you can create them from the dist.
+
+This matters with the Docker setup: the container entrypoint copies the dists with `cp -n`, so a dist that is
+already in the mounted `etc` folder is never updated and new keys (for example `Cluster.Enabled`) go unnoticed.
+
 ## Usage
 
 ```bash
 python3 update_module_confs.py
 ```
 
-The first run asks for your `etc` folder (the one holding `worldserver.conf`) and saves it to `settings.json`
-next to the script. Later runs use it without asking.
+The first run asks for your `etc` folder (the one holding `worldserver.conf`) and your `azerothcore-wotlk`
+source folder, and saves both to `settings.json` next to the script. Later runs use them without asking.
 
 The menu lists every file with its status (`41 new, 14 conf-only`, `layout differs from dist`,
 `up to date`). Type `A` to update every file that needs it, or numbers such as `1,3,5`. For each file you
@@ -39,14 +57,16 @@ are asked how to handle new keys, then whether to write, with an option to view 
 
 | Option | Effect |
 |---|---|
-| `--etc-dir PATH` | Use this folder for this run only (the saved folder stays as it is) |
-| `--reconfigure` | Ask for the folder again and save it |
+| `--etc-dir PATH` | Use this config folder for this run only (the saved folder stays as it is) |
+| `--source-dir PATH` | Use this `azerothcore-wotlk` source folder for this run only (the saved folder stays as it is) |
+| `--reconfigure` | Ask for both folders again and save them |
+| `--no-refresh` | Do not refresh the deployed `.conf.dist` files from the source folder |
 | `--all` | Process every file that needs it, without the menu |
 | `--yes` | Add all new keys and write without asking |
-| `--dry-run` | Print summaries and diffs, write nothing |
+| `--dry-run` | List the dists that would be refreshed, print summaries and diffs (against those dists), write nothing |
 
-Typical update: copy the new `.conf.dist` files into the `etc`/`etc/modules` folders, then run
-`python3 update_module_confs.py --all --dry-run` to review, and `python3 update_module_confs.py` to apply.
+Typical update: pull the core and modules, run `python3 update_module_confs.py --all --dry-run` to review,
+then `python3 update_module_confs.py` to refresh the dists and apply.
 
 ## Requirements
 
